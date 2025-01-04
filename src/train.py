@@ -2,8 +2,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torch.optim import SGD
-from torch.amp import autocast, GradScaler
+from torch.optim import SGD, AdamW
 import torch.optim.lr_scheduler as schedule
 
 import numpy as np
@@ -11,10 +10,8 @@ from math import inf
 
 import time
 
-from pathlib import Path
-
 from model import SwinSeg
-from dataset import CityscapesDataset
+from dataset_cs import CityscapesDataset
 from config import config
 
 
@@ -56,12 +53,10 @@ def train(resume=False, resume_file_path=None):
     )
     
     # initialize focal loss with ignore class 19
-    loss_fn = FocalLoss(ignore_index=19)
+    loss_fn = nn.CrossEntropyLoss(ignore_index=19)
     
-    # scales the loss/gradients after switching to float16 to avoid underflow/overflow
-    scaler = GradScaler('cuda' if torch.cuda.is_available() else 'cpu')
     
-    log_step = 30
+    log_step = 5
     global_step = 0  #counter for tensorboard
 
     
@@ -70,6 +65,9 @@ def train(resume=False, resume_file_path=None):
     # initialize lists to hold model parameters
     bias = []
     weight = []
+    best_miou = 0
+    best_loss = float(inf)
+    best_acc = 0
     
     # seperate model parameters into weights and biases
     for name, param in swinseg.named_parameters():
@@ -82,19 +80,13 @@ def train(resume=False, resume_file_path=None):
     assert len(bias) > 0
         
     # initialize optimizer with momentum (add accumulated past gradients to smoothen updates)
-    optimizer = SGD(params=[
-        # lr = 8e-4
+    optimizer = AdamW(
+        params=[
+           # lr = 8e-4
         {'params' : bias, 'lr' : 2 * config.LEARNING_RATE}, # 2 x lr
         {'params' : weight, 'lr' : config.LEARNING_RATE}
-        #  momentum = 0.9, wd = 5e-6
-        ], momentum=config.MOMENTUM, weight_decay=config.WEIGHT_DECAY)
-    
-    scheduler = schedule.CyclicLR(
-        optimizer,
-        base_lr=4e-5,
-        max_lr=3e-3,
-        step_size_up=300,  # Steps per half cycle
-        mode='triangular2'  # Decreasing amplitude over time
+        #  momentum = 0.9, wd = 5e-6 
+        ], betas=(0.9, 0.999), weight_decay=1e-4
     )
         
     ''' training loop '''
@@ -125,18 +117,21 @@ def train(resume=False, resume_file_path=None):
                 data = data.to(device)
                 label = label.to(device)
                 
-                # use automatic mixed precision (float32 vs float16) for efficiency
-                with autocast('cuda' if torch.cuda.is_available() else 'cpu', enabled=True):
-                    # forward pass  
-                    output = swinseg(data)
-                    loss = loss_fn(output, label) / config.ACCUM_STEPS
+                # forward pass  
+                output = swinseg(data)
+                loss = loss_fn(output, label)
+                
+                
+                # miou is the mean of the class ious
+                miou = np.mean(class_iou(output, label)[0])
+                acc = pixel_acc(output, label)
+                
+                best_loss = min(loss, best_loss)
+                best_acc = max(best_acc, acc)
+                best_miou = max(best_miou, miou)
                 
                 # log loss
                 if step % log_step == 0:
-                    
-                    # miou is the mean of the class ious
-                    miou = np.mean(class_iou(output, label)[0])
-                    acc = pixel_acc(output, label)
                     print(f'{loss}, {miou}, {acc}')
                     
                     # log loss and miou 
@@ -147,25 +142,26 @@ def train(resume=False, resume_file_path=None):
                     # log sample predictions
                     if step % (log_step * 10) == 0:
                         pred = output.softmax(dim=1).argmax(dim=1)
-                        writer.add_images('Predictions', pred.unsqueeze(1).float() // 19, global_step)
-                        writer.add_images('Ground Truth', label.unsqueeze(1).float() // 19, global_step)
+                        writer.add_images('Predictions', pred.unsqueeze(1).float(), global_step)
+                        writer.add_images('Ground Truth', label.unsqueeze(1).float(), global_step)
+                    
+                    
+                    if step % 200 == 0:
+                        torch.save({
+                            'epoch': epoch,
+                            'model_state_dict': swinseg.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'best_miou': best_miou,
+                        }, f'checkpoints/per200/run_{config.RUN}_BA_{best_acc}_.pth')
                 
                 # backward pass (calculate gradients)
-                # scales loss if needed to prevent underflow
-                scaler.scale(loss).backward()
-
+                loss.backward()
+                # gradient clipping (learned lesson the hard way)
+                torch.nn.utils.clip_grad_norm_(swinseg.parameters(), max_norm=3) 
                 # update parameters
-                # unscales gradients back to original scale
-                scaler.step(optimizer)
-                
-                scheduler.step()
-                
-                # adjusts scale factor
-                scaler.update()
-                
+                optimizer.step()
                 # reset gradients to 0 (so they don't accumulate past step size)
                 optimizer.zero_grad(set_to_none=True)
-            
                 # update for tb
                 global_step += 1
                     

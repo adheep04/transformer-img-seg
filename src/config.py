@@ -4,7 +4,7 @@ import numpy as np
 class Config:
     
     # training/validation run num/type
-    RUN = '6'
+    RUN = 'swintest3'
     
     # Paths
     DATA_TRAIN_DIR = Path("data/cityscapes/train/img") 
@@ -18,16 +18,16 @@ class Config:
     LOG_DIR = Path("logs")
 
     # Model hyperparameters
-    BATCH_SIZE = 1
-    LEARNING_RATE = 5e-4
-    NUM_EPOCHS = 10
-    MOMENTUM = 0.96
+    BATCH_SIZE = 4
+    LEARNING_RATE = 1e-5
+    NUM_EPOCHS = 20
+    MOMENTUM = 0.90
     WEIGHT_DECAY = 5e-5
     ALPHA = 1
     GAMMA = 0.4
     
     # image crop to save memory during training
-    MAX_PIXELS = 640*640
+    MAX_PIXELS = 1024*1024
     
     # 'class', true_id, color
     LABELS = {  

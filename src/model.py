@@ -9,6 +9,10 @@ import torch
 from torchvision.models import swin_v2_t, Swin_V2_T_Weights
 import torchvision.transforms as T
 from torch.nn import functional as F 
+import math
+from pathlib import Path
+from PIL import Image
+
 
 class SwinSeg(nn.Module):
     def __init__(self, n_class):        
@@ -21,57 +25,28 @@ class SwinSeg(nn.Module):
         self.norm = base_model.norm
         
         # returns prediction scores for intermediate layers and final
-        self.s8_score = nn.Conv2d(192, n_class, 1, 1)
-        self.s16_score = nn.Conv2d(384, n_class, 1, 1)
-        self.out_score = nn.Conv2d(768, n_class, 1, 1)
+        self.fm96_proj = nn.Conv2d(96, 256, 1)
+        self.fm192_proj = nn.Conv2d(192, 256, 1)
+        self.fm384_proj = nn.Conv2d(384, 256, 1)
+        self.fm768_proj = nn.Conv2d(768, 256, 1)
+        self.smooth4 = nn.Conv2d(256, 256, 3, 1, padding=1)
+        self.smooth8 = nn.Conv2d(256, 256, 3, 1, padding=1)
+        self.smooth16 = nn.Conv2d(256, 256, 3, 1, padding=1)
         
-        # upsampling x2 learned initialized with bilinear interpolation weights shown below
-        self.upsample_a = nn.ConvTranspose2d(n_class, n_class, 4, 2, bias=False)
-        self.upsample_b = nn.ConvTranspose2d(n_class, n_class, 4, 2, bias=False)
+        # 256 -> class size
+        self.score = nn.Conv2d(256, n_class, 1)
         
-        # Deeper decoder with residuals
-        self.decoder = nn.ModuleDict({
-            'level1': nn.Sequential(
-                ResBlock(768, 512),
-                ResBlock(512, 512)
-            ),
-            'level2': nn.Sequential(
-                ResBlock(512 + 384, 256),
-                ResBlock(256, 256)
-            ),
-            'level3': nn.Sequential(
-                ResBlock(256 + 192, n_class),
-                ResBlock(n_class, n_class)
-            )
-        })
-
-       
-        # initialize weights
-        self._init_weights(n_class)
+        # initialize weights with kaiming
+        nn.init.kaiming_uniform_(self.fm96_proj.weight,)
+        nn.init.kaiming_uniform_(self.fm192_proj.weight,)
+        nn.init.kaiming_uniform_(self.fm384_proj.weight,)
+        nn.init.kaiming_uniform_(self.fm768_proj.weight,)
+        nn.init.kaiming_uniform_(self.smooth4.weight,)
+        nn.init.kaiming_uniform_(self.smooth8.weight,)
+        nn.init.kaiming_uniform_(self.smooth16.weight,)
+        nn.init.kaiming_uniform_(self.score.weight,)
         
-    
-    def _init_weights(self, n_class):
-        '''
-        initializes bilinear interpolation weights for learned upsample layers
         
-        '''
-  
-        # initialize deconvolution weights like that of bilinear interpolation and have it learnable
-        # https://github.com/tnarihi/caffe/commit/4f249a00a29432e0bb6723087ec64187e1506f0f <- used this code to produce the following initialization
-        bilinear_interp_weights = torch.tensor(
-            [[[[0.0625, 0.1875, 0.1875, 0.0625],
-            [0.1875, 0.5625, 0.5625, 0.1875],
-            [0.1875, 0.5625, 0.5625, 0.1875],
-            [0.0625, 0.1875, 0.1875, 0.0625]]]]
-        ).repeat((n_class, n_class, 1, 1))
-        
-        # duplicate along in_channel and out_channel dimension for size (1, 1, 4, 4) -> (n_class, n_class, 4, 4)
-        self.upsample_a.weight.data = bilinear_interp_weights
-        self.upsample_b.weight.data = bilinear_interp_weights
-        
-        nn.init.xavier_uniform_(self.s8_score.weight)
-        nn.init.xavier_uniform_(self.s16_score.weight)
-        nn.init.xavier_uniform_(self.out_score.weight)
         
     def forward(self, x):
         '''
@@ -83,58 +58,73 @@ class SwinSeg(nn.Module):
         
         '''
         # get img spatial dimensions
-        input_res = (x.shape[-2], x.shape[-1])
+        img_res = x.shape[-2:]
         
-        ''' forward pass through most of base net swin'''
+        ''' forward pass through swin backbone'''
         
         x = self.base[0](x)
-        # down x4
-        x = self.base[1](x)
-        # down x2
-        x = self.base[2](x)
-        skip8 = x = self.base[3](x)
-        # down x2
-        x = self.base[4](x)
-        skip16 = x = self.base[5](x)
+        fm96 = x = self.base[1](x)        
+        x = self.base[2](x)         
+        fm192 = x = self.base[3](x)
+        x = self.base[4](x)         
+        fm384 = x = self.base[5](x)
         x = self.base[6](x)
-        # down x2
-        x = self.base[7](x)
-        x = self.norm(x)
+        x = self.base[7](x)         
         
-        x = self.permute(x)
-        skip16 = self.permute(skip16)
-        skip8 = self.permute(skip8)
+        ''' norm and rearrange tensor dims'''
         
-        x = self.decoder['level1'](x)
-        skip16 = F.interpolate(skip16, size=(x.shape[2], x.shape[3]), mode='bilinear')
-        x = torch.cat([x, skip16], dim=1)
+        fm96 = self.permute(fm96)
+        fm192 = self.permute(fm192)
+        fm384 = self.permute(fm384)
+        fm768 = self.permute(self.norm(x))
         
-        x = self.decoder['level2'](x)
-        skip8 = F.interpolate(skip8, size=(x.shape[2], x.shape[3]), mode='bilinear')
-        x = torch.cat([x, skip8], dim=1)
+        ''' feature pyramid network '''
         
-        x = self.decoder['level3'](x)
+        # project to 256 dimensions
+        fm96 = self.fm96_proj(fm96)
+        fm192 = self.fm192_proj(fm192)
+        fm384 = self.fm384_proj(fm384)
+        fm768 = self.fm768_proj(fm768)
+                
+        fuse16 = self.smooth16(fm384 + F.interpolate(fm768, size=fm384.shape[-2:], mode='bilinear', align_corners=False))
+        fuse8 = self.smooth8(fm192 + F.interpolate(fuse16, size=fm192.shape[-2:], mode='bilinear', align_corners=False))
+        fuse4 = self.smooth4(fm96 + F.interpolate(fuse8, size=fm96.shape[-2:], mode='bilinear', align_corners=False))
         
-    def _expand(self, small, big):
-        '''
-        expands the slightly smaller tensor to be the size of the bigger
-        using bilinear interpolation (big and small are very close in size)
+        score = self.score(fuse4)
         
-        '''
-        assert big.shape[2] > small.shape[2] and big.shape[3] > small.shape[3], "big not bigger than small"
+        return F.interpolate(score, size=img_res, mode='bilinear', align_corners=False)
+
+
+
+transform = T.Compose([
+    # transforms.Resize((224, 224)),  
+    T.ToTensor(),
+    T.Normalize(mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225])  
+])
+
+def resize(img, max_pixels=1000*1000):
+    # max is 1024*1024 pixels
     
-        return F.interpolate(small, size=(big.shape[2], big.shape[3]), mode='bilinear', align_corners=False)
-    
-class ResBlock(nn.Module):
-   def __init__(self, in_c, out_c):
-       super().__init__()
-       self.conv1 = nn.Conv2d(in_c, out_c, 3, padding=1)
-       self.conv2 = nn.Conv2d(out_c, out_c, 3, padding=1)
-       self.relu = nn.ReLU()
-       self.proj = None if in_c == out_c else nn.Conv2d(in_c, out_c, 1)
-       
-   def forward(self, x):
-       identity = x if self.proj is None else self.proj(x)
-       x = self.relu(self.conv1(x))
-       x = self.conv2(x)
-       return self.relu(x + identity)
+    # get original image dimensions
+    w, h = img.size
+    # calculate scale ratio between original image necessary to hit max pixel size
+    ratio = math.sqrt(max_pixels / (w * h))
+    new_w = int(w * ratio)
+    new_h = int(h * ratio)
+    # resize height and width by proportional values to maintain aspect ratio
+    return T.Resize((new_h, new_w))(img)
+
+
+img_path = Path(r'data\donker_bergen_sneeuw_5000x5000-wallpaper-5120x2880.jpg')
+img_path.exists()
+img = Image.open(img_path)
+img_r = resize(img)
+img_tensor = transform(img_r).unsqueeze(0)
+
+swinseg = SwinSeg(30)
+swingseg = swinseg.to(torch.device('cuda'))
+img_tensor = img_tensor.to(torch.device('cuda'))
+print(img_tensor.shape)
+pred = swinseg(img_tensor)
+print(pred.shape)
